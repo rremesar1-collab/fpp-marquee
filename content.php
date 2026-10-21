@@ -66,8 +66,13 @@
 		m.textContent = msg || '';
 	}
 	function call(method, ep, body) {
-		return fetch(base + ep, { method: method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
-			.then(function (r) { return r.json(); });
+		var opt = { method: method, cache: 'no-store' };
+		if (body) { opt.headers = { 'Content-Type': 'application/json' }; opt.body = JSON.stringify(body); }
+		return fetch(base + ep, opt).then(function (r) {
+			return r.text().then(function (t) {
+				try { return JSON.parse(t); } catch (e) { throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 200)); }
+			});
+		});
 	}
 	function busy(b, on) { b.disabled = on; }
 	function load() {
@@ -83,7 +88,7 @@
 			log.textContent = (d.log || []).join('\n') || 'Nothing yet.';
 			if (atEnd) { log.scrollTop = log.scrollHeight; }
 			$('mqVersion').textContent = d.version ? 'Marquee names script ' + d.version : '';
-		}).catch(function () { $('mqState').textContent = 'Couldn’t read the status'; });
+		}).catch(function (e) { $('mqState').textContent = 'Couldn’t read the status'; $('mqState').title = String(e && e.message || e); console.log('[Marquee] status', e); });
 	}
 	$('mqConnect').addEventListener('click', function () {
 		var b = this, code = $('mqCode').value.trim();
