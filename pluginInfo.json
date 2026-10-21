@@ -1,0 +1,67 @@
+{
+	"repoName": "fpp-marquee",
+	"name": "Marquee - Your Name in Lights",
+	"author": "Alateka Corporation (rremesar1-collab)",
+	"description": "Puts the first names kids send on your Marquee show website up on your matrix, TV or projector, between songs or during them. Runs the Marquee names script for you: paste the connection code from your website (Marquee -> Settings -> Names & FPP) and it starts with FPP. It checks in with your own website (the address in the code) to fetch waiting names and your screen settings, and reports what's playing and its setup check back. During a Marquee Support session that you open on your website, it also sends this FPP's status, playlists and log there and can run a few fixes (setup check, names break playlists, restart). Spoken names and the names break audio are downloaded from your website into your music folder.",
+	"homeURL": "https://github.com/rremesar1-collab/fpp-marquee",
+	"srcURL": "https://github.com/rremesar1-collab/fpp-marquee.git",
+	"bugURL": "https://github.com/rremesar1-collab/fpp-marquee/issues",
+	"iconURL": "https://raw.githubusercontent.com/rremesar1-collab/fpp-marquee/main/icon.png",
+	"allowUpdates": 1,
+	"releaseNotesStyle": "gitHistory",
+	"privacy": {
+		"summary": "Checks in with your own Marquee website to get the names kids send and puts them on your screens. Nothing goes anywhere else.",
+		"sends": [
+			{
+				"to": "your Marquee website",
+				"what": "what's playing, which names were shown, and this FPP's setup check",
+				"why": "so names go up at the right time and your website shows the setup check",
+				"alwaysOn": false
+			},
+			{
+				"to": "your Marquee website",
+				"what": "this FPP's status, playlists, sequences and the plugin log",
+				"why": "so Marquee Support can see your FPP, only while you have a support session open",
+				"alwaysOn": false
+			}
+		],
+		"collects": [
+			{
+				"what": "spoken names (short audio clips of kids' first names)",
+				"about": "visitors",
+				"keptDays": null,
+				"canDelete": false,
+				"where": "music/ (files starting with marquee-voice-); the newest 300 are kept"
+			},
+			{
+				"what": "kids' first names, in the plugin log",
+				"about": "visitors",
+				"keptDays": null,
+				"canDelete": false,
+				"where": "plugin log"
+			}
+		],
+		"sensors": [],
+		"remoteAccess": "none",
+		"systemChanges": [
+			{
+				"kind": "service",
+				"what": "runs the Marquee names script in the background whenever FPP is running (as the fpp user)"
+			},
+			{
+				"kind": "core-settings",
+				"what": "creates and updates the names break playlists (Names in Lights, Names in Lights 1 and 2) through FPP's API"
+			}
+		],
+		"closedCode": false,
+		"other": "Marquee Support access: only while you have a support session open on your website, Marquee Support can ask this FPP to run the setup check, set up the names break playlists again, restart the names script or show a test name. Every one is shown to you in the support chat. The plugin's pages have no password, like FPP's own."
+	},
+	"versions": [
+		{
+			"minFPPVersion": "10.0",
+			"maxFPPVersion": "0",
+			"branch": "main",
+			"sha": ""
+		}
+	]
+}

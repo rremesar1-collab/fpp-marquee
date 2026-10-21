@@ -1,0 +1,1121 @@
+#!/usr/bin/env python3
+"""
+Marquee - "Your Name in Lights" for FPP   (version 3.1)
+---------------------------------------------------------
+Runs on your FPP master. Kids send their first name on your Marquee website.
+
+  * While the show plays, this checks your website every 20 seconds.
+  * When names are waiting, it tells FPP to play your short "Names in Lights"
+    break right AFTER the current song finishes. Names never cover a song.
+  * During the break it shows up to 6 names, one at a time, on your screens
+    (any FPP Pixel Overlay Model: a matrix, a projector, a TV).
+  * If your website has "Say each name out loud" on, it downloads each
+    spoken name (made by your website with ElevenLabs) and plays it as the
+    name goes up, optionally with a "talking faces" effect on your props.
+  * It tells your website what FPP is playing (Show Control in WP Admin) and
+    how its setup check went (Marquee -> Settings -> Names & FPP).
+
+Your website never connects into your house: this script reaches out to it,
+so no router ports need to be opened.
+
+Easiest: install the Marquee plugin in FPP's Plugin Manager - it runs this script for you.
+By hand: settings live in marquee_names.json next to this script. Download that file
+from your website (Marquee -> Settings -> Names & FPP), or make it here with:
+    python3 /home/fpp/media/scripts/marquee_names.py --setup
+
+Install (once) - the full guide is "Marquee names - setup guide.txt":
+  1. FPP -> Content Setup -> File Manager -> Scripts -> upload this file
+     and marquee_names.json.
+  2. FPP -> Content Setup -> Command Presets: FPPD_STARTED -> "Run Script"
+     -> marquee_names.py
+  3. Restart FPPD. The setup check shows on your website within a minute.
+     Log: File Manager -> Logs -> marquee_names.log
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "3.7"
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Where the settings file may be: next to this script, or wherever FPP's File Manager
+# put it (it files .json uploads under Uploads or Config, not Scripts).
+CONFIG_PLACES = [os.path.join(HERE, "marquee_names.json"),
+                 "/home/fpp/media/scripts/marquee_names.json",
+                 "/home/fpp/media/upload/marquee_names.json",
+                 "/home/fpp/media/uploads/marquee_names.json",
+                 "/home/fpp/media/config/marquee_names.json"]
+CONFIG = os.environ.get("MARQUEE_NAMES_CONFIG", "")
+
+
+def config_path():
+    if CONFIG:
+        return CONFIG
+    for p in CONFIG_PLACES:
+        if os.path.exists(p):
+            return p
+    return CONFIG_PLACES[0]
+MASTER = os.environ.get("MARQUEE_FPP", "http://127.0.0.1")
+LOCK = os.environ.get("MARQUEE_LOCK", "/tmp/marquee_names.pid")
+PLUGIN = os.environ.get("MARQUEE_PLUGIN", "") == "1"          # started by the Marquee FPP plugin
+LOGFILE = os.environ.get("MARQUEE_LOG", "/home/fpp/media/logs/marquee_names.log")
+DATA = os.environ.get("MARQUEE_DATA", HERE)                   # break state (and the plugin's restart request)
+MUSIC = os.environ.get("MARQUEE_MUSIC", "/home/fpp/media/music")   # spoken names are saved here (FPP plays media from this folder)
+VOICE_PREFIX = "marquee-voice-"
+VOICE_KEEP = 300                                                    # newest clips kept on the FPP
+UA = "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 FPP-Marquee/" + VERSION
+
+DEFAULTS = {
+    "site": "",                       # your website, e.g. https://yourshow.com/
+    "key": "",                        # private key from Marquee -> Settings -> Names & FPP
+    "break_playlist": "Names in Lights",
+    "screens": [],                    # [{"name": "matrix", "fpp": "http://192.168.1.50", "model": "MatrixText"}]
+    "names_start": 4.0,               # seconds into the break when the first name appears
+    "slot": 3.75,                     # seconds per name
+    "show_for": 3,                    # seconds each name stays up
+    "max_names": 6,                   # names per break; the rest wait for the next one
+    "max_width": 0.62,                # text stays inside this part of the screen (fraction of width)
+    "max_height": 0.42,               # ... and of height
+    "font": "",                       # "" picks a bold font automatically
+    "check_every": 20,                # seconds between website checks during songs
+    "voice": True,                    # play spoken names when the website sends them (false = never)
+    "voice_volume": 0,                # -100..100, added to FPP's volume for the spoken names
+    "voice_slot": 2,                  # FPP media stream slot for the names (slot 1 is the break's own music)
+    "short_breaks": True,             # 1 or 2 names: use "<break playlist> 1" / "<break playlist> 2" if they exist
+    "say_every_time": True,           # with fewer names than slots the screens repeat them: say them again each time
+    "talk_effect": "",                # FPP effect (.eseq) that moves the singing faces while a name is spoken
+    "mode": "break",                  # "break": a names break between songs; "live": during songs on a spare screen
+    "live_show_for": 6,               # live mode: seconds each name stays up
+}
+MODE = {"mode": None, "show_for": None}   # what the website said last (it wins over the settings file)
+ADVISORY = {"now": None, "last": 0.0}     # traffic & parking alert from Show Control, put on the screens now and then
+
+
+def live():
+    return (MODE["mode"] or S["mode"]) == "live"
+
+S = dict(DEFAULTS)
+
+
+LOGBUF = []          # the last log lines, for a Marquee Support session
+
+
+def log(*a):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(x) for x in a)
+    print(line, flush=True)
+    LOGBUF.append(line)
+    del LOGBUF[:-80]
+    try:
+        if not PLUGIN and os.path.exists(LOGFILE) and os.path.getsize(LOGFILE) > 500000:   # FPP rotates the plugin's log itself
+            os.replace(LOGFILE, LOGFILE + ".old")
+        with open(LOGFILE, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------ settings ----
+def load_settings():
+    """Read marquee_names.json. Returns a list of problems (empty = good)."""
+    S.clear()
+    S.update(DEFAULTS)
+    cfg = config_path()
+    if not os.path.exists(cfg):
+        return ["no settings file. Download marquee_names.json from your website "
+                "(Marquee -> Settings -> Names & FPP) and upload it in FPP -> File Manager "
+                "(looked in: %s)" % ", ".join(sorted(set(os.path.dirname(p) for p in CONFIG_PLACES)))]
+    try:
+        with open(cfg) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return ["could not read %s: %s" % (cfg, e)]
+    if isinstance(data, dict):
+        S.update({k: v for k, v in data.items() if k in DEFAULTS})
+    problems = []
+    if not str(S["site"]).startswith(("http://", "https://")):
+        problems.append("the website address in the settings file must start with https://")
+    if len(str(S["key"])) < 20:
+        problems.append("the private key in the settings file is missing or too short")
+    S["screens"] = clean_screens(S["screens"])
+    break_timing()
+    return problems
+
+
+def clean_screens(rows):
+    screens = []
+    for i, sc in enumerate(rows or []):
+        if isinstance(sc, dict) and sc.get("fpp") and sc.get("model"):
+            host = str(sc["fpp"]).strip()
+            if not host.startswith("http"):
+                host = "http://" + host
+            screens.append({"name": (str(sc.get("name") or "") or "screen %d" % (i + 1)).strip(), "fpp": host.rstrip("/"), "model": str(sc["model"]).strip()})
+    return screens
+
+
+def break_timing():
+    st = break_state()
+    if st.get("start") and st.get("slot"):     # timing of the break audio built on the website wins
+        S["names_start"] = float(st["start"])
+        S["slot"] = float(st["slot"])
+        S["show_for"] = max(2.0, float(st["slot"]) - 0.6)
+
+
+SITE_KEYS = ("break_playlist", "names_start", "slot", "show_for", "talk_effect")
+
+
+def site_config(cfg):
+    """Your screens and timing as set on the website now (so changing them there needs no new settings file)."""
+    if not isinstance(cfg, dict):
+        return
+    if "screens" in cfg:
+        new = clean_screens(cfg.get("screens"))
+        if new != LAST.get("screens"):
+            log("screens from the website:", ", ".join("%s=%s on %s" % (x["name"], x["model"], x["fpp"]) for x in new) or "none")
+            LAST["screens"] = new
+            _info.clear()
+        S["screens"] = new
+    for k in SITE_KEYS:
+        if cfg.get(k) not in (None, ""):
+            try:
+                S[k] = str(cfg[k]) if isinstance(DEFAULTS[k], str) else float(cfg[k])
+            except (TypeError, ValueError):
+                pass
+    break_timing()
+
+
+# ---------------------------------------------------------------- HTTP ----
+def http_json(url, data=None, timeout=15):
+    if data is not None:
+        data = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, "Accept": "application/json, text/plain, */*"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read().decode("utf-8", "replace")
+    try:
+        return json.loads(body or "null")
+    except ValueError:
+        if "captcha" in body.lower():
+            raise RuntimeError("your web host's bot protection blocked the request (see the setup guide, 'Bot protection')")
+        raise RuntimeError("expected JSON but got: " + body[:120].replace("\n", " "))
+
+
+def fpp_get(host, path, timeout=5):
+    return http_json(host.rstrip("/") + path, timeout=timeout)
+
+
+def fpp_command(host, name, args, timeout=5):
+    body = json.dumps({"command": name, "args": [str(a) for a in args]}).encode()
+    req = urllib.request.Request(host.rstrip("/") + "/api/command", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------- website ----
+def pull(done_ids, st=None, report=None):
+    """Ask the website for waiting names; report the ones already shown, what FPP is doing, and the setup check."""
+    url = str(S["site"]).rstrip("/") + "/wp-admin/admin-ajax.php?action=rr_names_pull&key=" + urllib.parse.quote(str(S["key"]))
+    data = {"done": ",".join(str(i) for i in done_ids)} if done_ids else {"ping": "1"}
+    if st is not None:
+        data["fpp"] = json.dumps({"status": status_name(st), "playlist": playlist_name(st),
+                                  "sequence": st.get("current_sequence", "")})
+    if report is not None:
+        data["report"] = json.dumps(report)
+    res = http_json(url, data)
+    if not res or not res.get("success"):
+        raise RuntimeError("website said: %s" % (res,))
+    if isinstance(res["data"], dict):
+        if res["data"].get("mode") in ("break", "live"):
+            if MODE["mode"] and MODE["mode"] != res["data"]["mode"]:
+                log("website switched names to", "during songs on the screens" if res["data"]["mode"] == "live" else "a names break between songs")
+            MODE["mode"] = res["data"]["mode"]
+        ADVISORY["now"] = res["data"].get("advisory") if isinstance(res["data"].get("advisory"), dict) else None
+        if res["data"].get("live_show_for"):
+            MODE["show_for"] = float(res["data"]["live_show_for"])
+        site_config(res["data"].get("config"))
+        if isinstance(res["data"].get("break"), dict):
+            LAST["break"] = res["data"]["break"]
+        sup = res["data"].get("support")
+        SUPPORT["on"] = bool(isinstance(sup, dict) and sup.get("on"))
+        if SUPPORT["on"]:
+            try:
+                support_answer(sup)
+            except Exception as e:
+                log("support view: could not send -", e)
+        THEMES.clear()
+        for t in res["data"].get("themes") or []:
+            if isinstance(t, dict) and t.get("slug") and t.get("playlist"):
+                THEMES[t["slug"]] = t
+    if isinstance(res["data"], dict) and res["data"].get("break"):
+        try:
+            sync_break(res["data"]["break"])
+        except Exception as e:
+            log("could not set up the names break from the website:", e)
+    return res["data"]
+
+
+# --------------------------------------------------- break from website ----
+STATE = os.path.join(DATA, "marquee_break_state.json")
+BREAK_FILES = {"full": "marquee-break-full.wav", "short2": "marquee-break-2.wav", "short1": "marquee-break-1.wav"}
+
+
+def break_state():
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def download(url, path, limit=40_000_000):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "audio/*,*/*"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = r.read(limit)
+    if len(data) < 1000 or data[:4] not in (b"RIFF", b"ID3\x03", b"ID3\x04") and data[:1] != b"\xff":
+        raise RuntimeError("the website sent back a page instead of audio (bot protection?)")
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def sync_break(b):
+    """The website built new break audio: download it and set up the break playlists (full, 1 and 2 names)."""
+    if not isinstance(b, dict) or not b.get("v") or not b.get("full"):
+        return
+    st = break_state()
+    if str(st.get("v")) == str(b["v"]) or in_break(master_status()):
+        return
+    for k, name in BREAK_FILES.items():
+        if not b.get(k):
+            return
+        download(b[k], os.path.join(MUSIC, name))
+    bp = S["break_playlist"]
+    base = fpp_get(MASTER, "/api/playlist/" + urllib.parse.quote(bp)) or {}
+    entries = [e for e in (base.get("mainPlaylist") or []) if isinstance(e, dict) and e.get("sequenceName")]
+    if not entries:
+        raise RuntimeError("playlist '%s' has no sequence in it - add your names sequence to it first" % bp)
+    if "backup" not in st:
+        st["backup"] = base                    # the playlist as it was before Marquee changed it
+    entry = dict(entries[0])
+    for n, (key, pl) in enumerate((("full", bp), ("short2", bp + " 2"), ("short1", bp + " 1"))):
+        e = dict(entry)
+        e["type"] = "both"
+        e["mediaName"] = BREAK_FILES[key]
+        new = dict(base)
+        new["name"] = pl
+        new["mainPlaylist"] = [e]
+        new["leadIn"] = []
+        new["leadOut"] = []
+        body = json.dumps(new).encode()
+        req = urllib.request.Request(MASTER.rstrip("/") + "/api/playlist/" + urllib.parse.quote(pl), data=body,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+    st.update({"v": str(b["v"]), "start": float(b.get("start") or S["names_start"]), "slot": float(b.get("slot") or S["slot"]),
+               "seq": entry.get("sequenceName"), "t": time.strftime("%Y-%m-%d %H:%M")})
+    with open(STATE, "w") as f:
+        json.dump(st, f, indent=1)
+    S["names_start"], S["slot"] = st["start"], st["slot"]
+    S["show_for"] = max(2.0, st["slot"] - 0.6)
+    _playlists["t"] = 0
+    log("names break updated from the website: '%s', '%s 2' and '%s 1' now play the new audio "
+        "(names start at %ss, one every %ss)" % (bp, bp, bp, st["start"], st["slot"]))
+
+
+# ------------------------------------------------------------- support ----
+SUPPORT = {"on": False, "id": "", "sent": 0, "tests": set(), "done": set()}
+LAST = {"break": None}
+
+
+def support_view():
+    """What Marquee Support sees during a session: read-only facts about this FPP, no secrets."""
+    st = master_status()
+    cp = st.get("current_playlist") or {}
+    view = {"v": VERSION, "t": int(time.time()),
+            "status": status_name(st), "playlist": cp.get("playlist", "") if isinstance(cp, dict) else "",
+            "sequence": st.get("current_sequence", ""), "song": st.get("current_song", ""),
+            "fpp_version": st.get("version", "") or "", "mode": MODE["mode"] or "",
+            "break_playlist": S["break_playlist"], "names_start": S["names_start"], "slot": S["slot"],
+            "screens": [], "playlists": [], "log": LOGBUF[-60:], "plugin": PLUGIN, "sequences": []}
+    try:
+        view["sequences"] = [str(x) for x in (fpp_get(MASTER, "/api/sequence") or [])][:80]
+    except Exception:
+        pass
+    try:
+        view["playlists"] = [str(p) for p in (fpp_get(MASTER, "/api/playlists") or [])][:60]
+    except Exception as e:
+        view["playlists_error"] = str(e)[:120]
+    for sc in S["screens"]:
+        row = {"name": sc["name"], "fpp": sc["fpp"], "model": sc["model"]}
+        try:
+            m = fpp_get(sc["fpp"], "/api/overlays/model/" + urllib.parse.quote(sc["model"])) or {}
+            row["size"] = "%s x %s" % (m.get("width", "?"), m.get("height", "?"))
+            row["ok"] = True
+        except Exception as e:
+            row["ok"] = False
+            row["error"] = str(e)[:120]
+        view["screens"].append(row)
+    return view
+
+
+def support_answer(sup):
+    """The website asked for a fresh view and/or a test name (only while the owner has support turned on)."""
+    if str(sup.get("id", "")) != SUPPORT["id"]:   # a new support session: start counting again
+        SUPPORT.update({"id": str(sup.get("id", "")), "sent": 0, "tests": set(), "done": set()})
+    shown = []
+    for t in (sup.get("tests") or [])[:3]:
+        tid = str(t.get("id", ""))
+        if not tid or tid in SUPPORT["tests"]:
+            continue
+        SUPPORT["tests"].add(tid)
+        text = str(t.get("text") or "TEST")[:40]
+        try:
+            n = show(text, "#FFFFFF")
+        except Exception as e:
+            log("support: test name could not be shown -", e)
+            n = 0
+        log("support: test name", repr(text), "shown on %d screen(s)" % n)
+        shown.append({"id": tid, "screens": n})
+    acted, restart = [], False
+    for a in (sup.get("actions") or [])[:3]:
+        aid, do = str(a.get("id", "")), str(a.get("do", ""))
+        if not aid or aid in SUPPORT["done"]:
+            continue
+        SUPPORT["done"].add(aid)
+        ok, msg = support_action(do)
+        log("support:", msg)
+        acted.append({"id": aid, "ok": ok, "msg": msg[:200]})
+        restart = restart or (do == "restart" and ok)
+    want = int(sup.get("want") or 0)
+    if not shown and not acted and want <= SUPPORT["sent"]:
+        return
+    SUPPORT["sent"] = max(want, SUPPORT["sent"])
+    view = support_view()
+    view["want"] = want
+    view["tests"] = shown
+    view["actions"] = acted
+    url = str(S["site"]).rstrip("/") + "/wp-admin/admin-ajax.php?action=marquee_support_fpp&key=" + urllib.parse.quote(str(S["key"]))
+    http_json(url, {"view": json.dumps(view)})
+    if restart:
+        restart_self("restart asked for by Marquee Support")
+
+
+def support_action(do):
+    """The few fixes Marquee Support can ask for (only while the owner has a support session open)."""
+    try:
+        if do == "restart":
+            return True, "names script restarting"
+        if do == "check":
+            checks, site_ok = run_checks(load_settings())
+            if site_ok:
+                send_report(checks)
+            bad = [c["msg"] for c in checks if not c["ok"]]
+            return True, "setup check ran: " + ("all good" if not bad else "; ".join(bad))
+        if do == "playlists":
+            if live():
+                return False, "names go up during songs, so there are no names break playlists to set up"
+            if not LAST["break"]:
+                return False, "no names break audio has been built on the website yet (Settings -> Names & FPP -> Names break audio)"
+            st = break_state()
+            st.pop("v", None)
+            with open(STATE, "w") as f:
+                json.dump(st, f, indent=1)
+            sync_break(LAST["break"])
+            return True, "names break playlists set up again: '%s', '%s 2' and '%s 1'" % ((S["break_playlist"],) * 3)
+        return False, "unknown fix '%s' (update the names script)" % do
+    except Exception as e:
+        return False, "%s failed: %s" % (do, e)
+
+
+def restart_self(why):
+    log(why)
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+# -------------------------------------------------------------- master ----
+def master_status():
+    try:
+        return fpp_get(MASTER, "/api/fppd/status") or {}
+    except Exception as e:
+        log("could not read FPP status:", e)
+        return {}
+
+
+def status_name(st):
+    """FPP's status_name, fixed for FPP 10.1.x: it can say "playing media" while a playlist is playing
+    (status 1 with a current playlist). That's a playlist, so call it "playing"."""
+    sn = str(st.get("status_name") or "")
+    if sn.startswith("playing") and str(st.get("status")) == "1" and playlist_name(st):
+        return "playing"
+    return sn
+
+
+def playlist_name(st):
+    cp = st.get("current_playlist") or {}
+    return cp.get("playlist", "") if isinstance(cp, dict) else ""
+
+
+def in_break(st):
+    if status_name(st) != "playing":
+        return False
+    pl = playlist_name(st)
+    if pl == S["break_playlist"] or pl in short_playlists().values() or pl in theme_playlists().values():
+        return True
+    seq = (st.get("current_sequence") or "").lower().replace("_", " ")
+    return "names in lights" in seq
+
+
+def elapsed(st):
+    try:
+        if "milliseconds_elapsed" in st:
+            return float(st["milliseconds_elapsed"]) / 1000.0
+        return float(st.get("seconds_elapsed", 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+_playlists = {"t": 0, "names": []}
+
+
+def fpp_playlists():
+    """Playlist names on this FPP (cached for a minute)."""
+    if time.time() - _playlists["t"] > 60:
+        try:
+            _playlists["names"] = fpp_get(MASTER, "/api/playlists") or []
+            _playlists["t"] = time.time()
+        except Exception:
+            pass
+    return _playlists["names"]
+
+
+def short_playlists():
+    """The short breaks that exist: {name count: playlist}, e.g. {1: "Names in Lights 1", 2: "Names in Lights 2"}."""
+    if not S["short_breaks"]:
+        return {}
+    have = fpp_playlists()
+    out = {}
+    for n in (1, 2):
+        name = "%s %d" % (S["break_playlist"], n)
+        if name in have:
+            out[n] = name
+    return out
+
+
+def slots_for(st):
+    """Name slots in the break that is playing: a short break says each of its 1 or 2 names twice."""
+    for n, name in short_playlists().items():
+        if playlist_name(st) == name:
+            return n * 2
+    return int(S["max_names"])
+
+
+# ------------------------------------------------------ themed sequences ----
+THEMES = {}      # slug -> {"name", "playlist", "start", "slot"} from the website
+SKIPS = {}       # name id -> breaks it already waited through (it rides along in the next one)
+
+
+def theme_playlists():
+    """Themes whose playlist exists on this FPP: {slug: playlist}."""
+    have = fpp_playlists()
+    return {k: t["playlist"] for k, t in THEMES.items() if t["playlist"] in have}
+
+
+def name_theme(item):
+    """The theme a name goes up in ('' = the classic break). A theme without a playlist on this FPP falls back to classic."""
+    t = item.get("theme") or ""
+    return t if t in theme_playlists() else ""
+
+
+def eligible(names, theme):
+    """Names that go up in a break of this theme: the ones that picked it, plus any that already waited a break."""
+    return [n for n in names if name_theme(n) == theme or SKIPS.get(n.get("id"), 0) >= 1]
+
+
+def plan_break(names):
+    """Which playlist to play next: the theme the longest-waiting kid picked."""
+    theme = name_theme(names[0]) if names else ""
+    if theme:
+        return theme_playlists()[theme]
+    return short_playlists().get(len(eligible(names, "")), S["break_playlist"])
+
+
+def current_theme(st):
+    pl = playlist_name(st)
+    for k, name in theme_playlists().items():
+        if name == pl:
+            return k
+    return ""
+
+
+def queue_break(names=None):
+    # "ifNotRunning" = true so a second request never stacks a second break
+    pl = plan_break(names or [])
+    fpp_command(MASTER, "Insert Playlist After Current", [pl, -1, -1, "true"])
+    return pl
+
+
+# --------------------------------------------------------------- voice ----
+def voice_file(item):
+    """Local file name for a name's spoken clip, downloading it if needed. None = no voice for this name."""
+    url = item.get("audio") if S["voice"] else None
+    if not url or not str(url).startswith(("http://", "https://")):
+        return None
+    base = os.path.basename(urllib.parse.urlparse(url).path)
+    if not base.endswith((".mp3", ".wav")) or "/" in base or base.startswith("."):
+        return None
+    name = VOICE_PREFIX + base
+    path = os.path.join(MUSIC, name)
+    if os.path.exists(path) and os.path.getsize(path) > 500:
+        return name
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "audio/mpeg,*/*"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = r.read(3_000_000)
+        if len(data) < 500 or data[:1] == b"<":
+            raise RuntimeError("the website sent back a page instead of audio")
+        tmp = path + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        tidy_voice()
+        return name
+    except Exception as e:
+        log("could not download the spoken name for", item.get("text"), "-", e)
+        return None
+
+
+def tidy_voice():
+    try:
+        clips = sorted((os.path.getmtime(os.path.join(MUSIC, f)), f) for f in os.listdir(MUSIC) if f.startswith(VOICE_PREFIX))
+        for _, f in clips[:-VOICE_KEEP]:
+            os.remove(os.path.join(MUSIC, f))
+    except OSError:
+        pass
+
+
+def prefetch(names):
+    for item in names[:int(S["max_names"])]:
+        voice_file(item)
+
+
+def say(item):
+    """Start the spoken name (and the talking faces). Returns when to stop the faces, or 0."""
+    name = voice_file(item)
+    if not name:
+        return 0
+    try:
+        os.utime(os.path.join(MUSIC, name))       # newest-used clips are kept
+    except OSError:
+        pass
+    try:
+        # its own stream slot, so the break's music (slot 1) keeps playing underneath
+        fpp_command(MASTER, "Play Media", [name, 1, int(S["voice_volume"]), int(S["voice_slot"])])
+    except Exception as e:
+        log("could not play the spoken name:", e)
+        return 0
+    effs = talk_effects()
+    if not effs:
+        return 0
+    started = 0
+    for eff in effs:
+        try:
+            fpp_command(MASTER, "FSEQ Effect Start", [eff, "true", "false"])
+            started += 1
+        except Exception as e:
+            log("could not start the talking effect '%s':" % eff, e)
+    if not started:
+        return 0
+    try:
+        length = float(item.get("say_for") or 2.0)
+    except (TypeError, ValueError):
+        length = 2.0
+    return time.time() + max(0.5, min(8.0, length))
+
+
+def talk_effects():
+    """The talking faces effect name(s) from the settings file (commas allowed)."""
+    return [e.strip()[:-5] if e.strip().lower().endswith(".eseq") else e.strip()
+            for e in str(S["talk_effect"] or "").split(",") if e.strip()]
+
+
+def stop_talking():
+    for eff in talk_effects():
+        try:
+            fpp_command(MASTER, "FSEQ Effect Stop", [eff])
+        except Exception as e:
+            log("could not stop the talking effect:", e)
+
+
+# ------------------------------------------------------------- screens ----
+_info = {}
+
+
+def screen_info(sc):
+    """Overlay model size and a bold font for one screen (cached)."""
+    k = sc["fpp"] + "|" + sc["model"]
+    if k in _info:
+        return _info[k]
+    try:
+        m = fpp_get(sc["fpp"], "/api/overlays/model/" + urllib.parse.quote(sc["model"]))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RuntimeError("no overlay model named '%s' on %s" % (sc["model"], sc["fpp"]))
+        raise RuntimeError("FPP at %s answered %s" % (sc["fpp"], e.code))
+    except (urllib.error.URLError, OSError) as e:
+        raise RuntimeError("could not reach the FPP at %s (is it on, and is the address right?)" % sc["fpp"])
+    if not m or not m.get("width"):
+        raise RuntimeError("no overlay model named '%s' on %s" % (sc["model"], sc["fpp"]))
+    font = S["font"]
+    if not font:
+        try:
+            fonts = fpp_get(sc["fpp"], "/api/overlays/fonts") or []
+        except Exception:
+            fonts = []
+        for want in ("DejaVuSans-Bold", "DejaVu-Sans-Bold", "Helvetica-Bold", "Arial-Bold",
+                     "FreeSans-Bold", "LiberationSans-Bold"):
+            if want in fonts:
+                font = want
+                break
+        if not font:
+            bold = [f for f in fonts if "bold" in f.lower()]
+            font = bold[0] if bold else (fonts[0] if fonts else "")
+    _info[k] = (int(m["width"]), int(m["height"]), font)
+    return _info[k]
+
+
+def layout(text, width, height):
+    """Break after the comma (the name gets its own line), pick the biggest size that fits."""
+    if ", " in text:
+        a, b = text.split(", ", 1)
+        a += ","
+        wa, wb = a.split(" "), b.split(" ")
+        options = [[a, b]]
+        options += [[" ".join(wa[:i]), " ".join(wa[i:]), b] for i in range(1, len(wa))]
+        options += [[a, " ".join(wb[:i]), " ".join(wb[i:])] for i in range(1, len(wb))]
+    else:
+        options = [[text]]
+    best = None
+    for lines in options:
+        longest = max(len(l) for l in lines)
+        size = min(100, int(float(S["max_width"]) * width / (0.68 * longest)), int(float(S["max_height"]) * height / (1.25 * len(lines))))
+        key = (size, -len(lines), -longest)
+        if best is None or key > best[0]:
+            best = (key, (max(4, size), lines))
+    return best[1]
+
+
+def show(text, color):
+    """Put one name up on every screen; returns how many screens took it."""
+    ok = 0
+    for sc in S["screens"]:
+        try:
+            w, h, font = screen_info(sc)
+            size, lines = layout(text, w, h)
+            args = [sc["model"], "Transparent", "Text", color, font, size, "true", "Center", 0, S["show_for"],
+                    "\\n".join(lines)]
+            fpp_command(sc["fpp"], "Overlay Model Effect", args)
+            ok += 1
+        except Exception as e:
+            log("could not show on", sc["name"], "(", sc["fpp"], ") -", e)
+            _info.pop(sc["fpp"] + "|" + sc["model"], None)
+    return ok
+
+
+# --------------------------------------------------------------- break ----
+def run_break(color):
+    """Called when the break starts: fetch names, show them on the break's clock."""
+    keep = (S["names_start"], S["slot"], S["show_for"])
+    try:
+        return _run_break(color)
+    finally:
+        S["names_start"], S["slot"], S["show_for"] = keep
+
+
+def _run_break(color):
+    try:
+        data = pull([])
+        st = master_status()
+        theme = current_theme(st)
+        everyone = data.get("names") or []
+        if theme:                                   # a themed sequence: its own timing, up to 6 names
+            t = THEMES[theme]
+            S["names_start"] = float(t.get("start") or S["names_start"])
+            S["slot"] = float(t.get("slot") or S["slot"])
+            S["show_for"] = max(2.0, S["slot"] - 0.6)
+            slots = int(S["max_names"])
+        else:
+            slots = slots_for(st)
+        names = (eligible(everyone, theme) or everyone)[:min(int(S["max_names"]), slots)]
+        color = data.get("color") or color
+    except Exception as e:
+        log("break started but the website could not be reached:", e)
+        return []
+    log("break started%s with %d name(s), %d slot(s)" % ((" (theme: %s)" % THEMES[theme].get("name", theme)) if theme else "", len(names), slots))
+    shown = _show_names(names, slots, color)
+    # names that waited through this break go up in the next one, whatever theme it is
+    for n in everyone:
+        if n.get("id") not in shown:
+            SKIPS[n.get("id")] = SKIPS.get(n.get("id"), 0) + 1
+    for i in shown:
+        SKIPS.pop(i, None)
+    if len(SKIPS) > 500:
+        SKIPS.clear()
+    return shown
+
+
+def _show_names(names, slots, color):
+    prefetch(names)
+    done = []
+    talk_until = 0
+    # Fill every slot: with fewer names than slots, cycle through them.
+    for k in range(slots if names else 0):
+        item = names[k % len(names)]
+        at = float(S["names_start"]) + k * float(S["slot"])
+        while True:
+            if talk_until and time.time() >= talk_until:
+                stop_talking()
+                talk_until = 0
+            st = master_status()
+            if not in_break(st):
+                log("break ended early")
+                if talk_until:
+                    stop_talking()
+                return done
+            if elapsed(st) >= at:
+                break
+            time.sleep(0.1)
+        if show(item["text"], color):
+            log("showing:", item["text"])
+            if S["say_every_time"] or k < len(names):
+                if talk_until:
+                    stop_talking()
+                talk_until = say(item)
+            if item["id"] not in done:
+                done.append(item["id"])
+        else:
+            log("no screen took", item["text"], "- it will wait for the next break")
+    while in_break(master_status()):       # let the break finish
+        if talk_until and time.time() >= talk_until:
+            stop_talking()
+            talk_until = 0
+        time.sleep(0.2)
+    if talk_until:
+        stop_talking()
+    return done
+
+
+# ---------------------------------------------------------------- live ----
+def show_live(names, color):
+    """Live mode: put the waiting names up one after another while the show plays. No voice:
+    it would talk over the music. Returns the ids shown."""
+    keep = S["show_for"]
+    S["show_for"] = float(MODE["show_for"] or S["live_show_for"])
+    done = []
+    try:
+        for item in names[:int(S["max_names"])]:
+            if status_name(master_status()) != "playing":
+                break                                  # show stopped: the rest wait for it to start again
+            if show(item["text"], color):
+                log("showing (during the song):", item["text"])
+                done.append(item["id"])
+                time.sleep(S["show_for"] + 1.0)
+            else:
+                log("no screen took", item["text"], "- trying again shortly")
+                break
+    finally:
+        S["show_for"] = keep
+    return done
+
+
+# --------------------------------------------------------------- check ----
+def run_checks(problems=None):
+    """Every setup check, as a list of {ok, what, msg}. Used by --check and sent to the website at start."""
+    out = []
+    add = lambda ok, what, msg: out.append({"ok": bool(ok), "what": what, "msg": msg})
+    for p in (problems or []):
+        add(False, "settings", p)
+    site_ok = False
+    site_voice = False
+    try:
+        d = pull([])
+        site_ok = True
+        site_voice = bool(d.get("voice"))
+        add(True, "website", "website and private key work (%d name(s) waiting)" % len(d.get("names") or []))
+        bst = break_state()
+        if d.get("break"):
+            ok = str(bst.get("v")) == str(d["break"].get("v"))
+            add(ok, "break", ("names break audio from the website is set up (built %s)" % bst.get("t", "")) if ok
+                else "names break audio from the website isn't on this FPP yet (see the log)")
+    except urllib.error.HTTPError as e:
+        add(False, "website", "the private key is wrong - download marquee_names.json again" if e.code == 403 else "website answered %s %s" % (e.code, e.reason))
+    except Exception as e:
+        add(False, "website", "could not reach the website: %s" % e)
+    if not S["screens"]:
+        add(False, "screen", "no screens set yet: add them on your website (Marquee -> Settings -> Names & FPP -> Your screens)")
+    st = master_status()
+    if st:
+        sn = status_name(st) or "?"
+        if sn in ("playing", "paused"):
+            add(True, "fpp", "FPP status: %s" % sn)
+        else:   # FPP 10 says "playing media" when only audio/a single file runs: no playlist, so no names break
+            add(True, "fpp", "FPP status: %s - names go up only while your show PLAYLIST is playing on this FPP (start it as a playlist, not a single sequence or Play Media)" % sn)
+    else:
+        add(False, "fpp", "could not read this FPP's status")
+    try:
+        pls = fpp_get(MASTER, "/api/playlists") or []
+        if live():
+            add(True, "playlist", "names go up during songs on the screens, so no names break playlist is needed")
+        elif S["break_playlist"] in pls:
+            short = [p for p in pls if p in ("%s 1" % S["break_playlist"], "%s 2" % S["break_playlist"])]
+            add(True, "playlist", "playlist '%s' found%s" % (S["break_playlist"], (" (short breaks: %s)" % ", ".join(short)) if short else ""))
+            for t in THEMES.values():
+                if t["playlist"] in pls:
+                    add(True, "theme", "themed sequence '%s': playlist '%s' found" % (t.get("name", ""), t["playlist"]))
+                else:
+                    add(False, "theme", "themed sequence '%s': no playlist named '%s' on this FPP (those names go up in the classic break)" % (t.get("name", ""), t["playlist"]))
+        else:
+            add(False, "playlist", "no playlist named '%s' on this FPP (found: %s)" % (S["break_playlist"], ", ".join(pls) or "none"))
+    except Exception as e:
+        add(False, "playlist", "could not list playlists: %s" % e)
+    if S["voice"] and site_voice and not live():
+        try:
+            cmds = fpp_get(MASTER, "/api/commands") or []
+            names = set(c.get("name") for c in cmds if isinstance(c, dict))
+            if "Play Media" in names:
+                add(True, "voice", "this FPP can play spoken names")
+            else:
+                add(False, "voice", "this FPP has no 'Play Media' command, so spoken names can't play (update FPP)")
+            if talk_effects():
+                effs = [str(e) for e in (fpp_get(MASTER, "/api/effects") or [])]
+                for want in talk_effects():
+                    if want in effs or want + ".eseq" in effs:
+                        add(True, "voice", "talking effect '%s' found" % want)
+                    else:
+                        add(False, "voice", "no effect named '%s' on this FPP (found: %s)" % (want, ", ".join(effs) or "none"))
+        except Exception as e:
+            add(False, "voice", "could not check spoken-name support: %s" % e)
+        if not os.access(MUSIC, os.W_OK):
+            add(False, "voice", "can't save spoken names in %s" % MUSIC)
+    for sc in S["screens"]:
+        try:
+            w, h, font = screen_info(sc)
+            if w < h:
+                add(False, "screen", "%s: overlay model '%s' is taller than wide (%d x %d) - strings and nodes are swapped in xLights" % (sc["name"], sc["model"], w, h))
+            else:
+                add(True, "screen", "%s: overlay model '%s' on %s is %d x %d, font %s" % (sc["name"], sc["model"], sc["fpp"], w, h, font or "none!"))
+        except Exception as e:
+            add(False, "screen", "%s (%s): %s" % (sc["name"], sc["fpp"], e))
+    return out, site_ok
+
+
+def send_report(checks):
+    try:
+        pull([], None, {"v": VERSION, "checks": checks})
+    except Exception as e:
+        log("could not send the setup check to the website:", e)
+
+
+def check():
+    print("\n=== Marquee names - setup check (v%s) ===\n" % VERSION)
+    checks, site_ok = run_checks(load_settings())
+    for c in checks:
+        print(("[OK] " if c["ok"] else "[X]  ") + c["msg"])
+    if site_ok:
+        send_report(checks)
+    if S["screens"]:
+        print("\nShowing a test name on every screen for %s seconds..." % S["show_for"])
+        show("MERRY CHRISTMAS!", "#FFFFFF")
+    bad = [c for c in checks if not c["ok"]]
+    print("\nAll good. Did MERRY CHRISTMAS! appear on your screens?" if not bad
+          else "\nFix the [X] lines above, then run --check again. The setup guide explains each one.")
+
+
+# --------------------------------------------------------------- setup ----
+def ask(q, default=""):
+    a = input("%s%s: " % (q, " [%s]" % default if default else "")).strip()
+    return a or default
+
+
+def setup():
+    print("\n=== Marquee names - setup ===")
+    print("Answer each question; press Enter to keep the value in [brackets].\n")
+    load_settings()
+    cur = dict(S)
+    site = ask("Your website address (like https://yourshow.com)", cur["site"])
+    if site and not site.startswith("http"):
+        site = "https://" + site
+    key = ask("Private key (Marquee -> Settings -> Names & FPP)", cur["key"])
+    pl = ask("FPP playlist that holds your names break", cur["break_playlist"])
+    screens = []
+    print("\nScreens: each one is an FPP Pixel Overlay Model (matrix, projector, TV).")
+    old = cur["screens"] or []
+    i = 0
+    while True:
+        o = old[i] if i < len(old) else {}
+        name = ask("Screen %d name (Enter with nothing to finish)" % (i + 1), o.get("name", "") if o else "")
+        if not name:
+            break
+        host = ask("  FPP address for '%s' (like 192.168.1.50; this FPP = 127.0.0.1)" % name, o.get("fpp", "") if o else "127.0.0.1")
+        model = ask("  Overlay model name on that FPP", o.get("model", "") if o else "")
+        screens.append({"name": name, "fpp": host if host.startswith("http") else "http://" + host, "model": model})
+        i += 1
+    data = {k: cur[k] for k in DEFAULTS}
+    data.update({"site": site, "key": key, "break_playlist": pl, "screens": screens})
+    with open(config_path(), "w") as f:
+        json.dump(data, f, indent=2)
+    print("\nSaved %s. Running the setup check...\n" % config_path())
+    check()
+
+
+# ---------------------------------------------------------------- main ----
+def cfg_stamp():
+    try:
+        return os.path.getmtime(config_path())
+    except OSError:
+        return 0
+def other_copy():
+    """Another names script running from a different place (the plugin's, or one put on the FPP by hand)."""
+    me = os.path.abspath(__file__)
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit() or int(pid) == os.getpid():
+                continue
+            try:
+                args = open("/proc/%s/cmdline" % pid, "rb").read().split(b"\0")
+            except OSError:
+                continue
+            args = [x.decode("utf-8", "replace") for x in args if x]
+            if len(args) == 2 and os.path.basename(args[0]).startswith("python") \
+                    and args[1].endswith("marquee_names.py") and os.path.abspath(args[1]) != me:
+                return args[1]        # a running copy (not a --check or --test run)
+    except OSError:
+        pass
+    return ""
+
+
+def single_instance():
+    other = other_copy()
+    if other:
+        log(("the names script you put on this FPP by hand is running (%s) - remove its Run Script command preset; "
+             "the Marquee plugin runs it for you now - exiting" if PLUGIN else
+             "the Marquee plugin already runs the names script (%s) - you can delete this copy and its Run Script command preset - exiting") % other)
+        sys.exit(0)
+    try:
+        if os.path.exists(LOCK):
+            old = int(open(LOCK).read().strip() or 0)
+            if old and old != os.getpid() and os.path.exists("/proc/%d" % old):
+                log("already running (pid %d) - exiting" % old)
+                sys.exit(0)
+        open(LOCK, "w").write(str(os.getpid()))
+    except (OSError, ValueError):
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+        setup()
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "--check":
+        check()
+        return
+    if len(sys.argv) > 2 and sys.argv[1] == "--test":
+        load_settings()
+        try:
+            pull([])                      # your screens come from the website
+        except Exception as e:
+            print("could not reach the website:", e)
+        print("shown on %d screen(s)" % show(sys.argv[2].upper(), "#FFFFFF"))
+        return
+    single_instance()
+    problems = load_settings()
+    while problems and not (S["site"] and S["key"]):
+        for p in problems:
+            log("setup problem:", p)
+        time.sleep(60)                        # wait for the settings file, check again in a minute
+        problems = load_settings()
+    log("started v%s; %s; screens: %s" % (
+        VERSION, "names during songs" if live() else "break playlist '%s'" % S["break_playlist"], ", ".join("%s=%s on %s" % (s["name"], s["model"], s["fpp"]) for s in S["screens"]) or "none"))
+    checks, site_ok = run_checks(problems)
+    for c in checks:
+        log(("ok: " if c["ok"] else "PROBLEM: ") + c["msg"])
+    if site_ok:
+        send_report(checks)
+    done = []
+    queued = False
+    last_check = 0.0
+    color = "#FFFFFF"
+    idle_said = 0.0
+    every = float(S["check_every"])
+    cfg_seen = cfg_stamp()
+    while True:
+        try:
+            if os.path.exists(os.path.join(DATA, "restart")) or cfg_stamp() != cfg_seen:
+                try:
+                    os.remove(os.path.join(DATA, "restart"))
+                except OSError:
+                    pass
+                restart_self("settings changed - restarting")
+            st = master_status()
+            if in_break(st):
+                done += run_break(color)
+                queued = False
+                pull(done)            # report what was shown
+                done = []
+                last_check = time.time()
+                continue
+            if status_name(st) != "playing":
+                queued = False
+                if done or time.time() - last_check >= (5 if SUPPORT["on"] else 60):      # idle: check in once a minute (every 5 s during a support session)
+                    last_check = time.time()
+                    data = pull(done, st) or {}
+                    done = []
+                    waiting = len(data.get("names") or [])
+                    if waiting and time.time() - idle_said >= 600:   # say why names wait, every 10 minutes at most
+                        idle_said = time.time()
+                        log("%d name(s) waiting, but FPP is '%s', not playing a playlist - names go up once your show playlist plays on this FPP"
+                            % (waiting, status_name(st) or "?"))
+                time.sleep(5)
+                continue
+            adv = ADVISORY["now"]
+            if adv and adv.get("text") and time.time() - ADVISORY["last"] >= float(adv.get("every") or 180):
+                ADVISORY["last"] = time.time()
+                keep = S["show_for"]
+                S["show_for"] = 6
+                try:
+                    if show(str(adv["text"])[:60], "#FFCC33"):
+                        log("traffic alert on the screens:", adv["text"])
+                finally:
+                    S["show_for"] = keep
+            if time.time() - last_check >= (min(every, 5) if SUPPORT["on"] else every):
+                last_check = time.time()
+                data = pull(done, st)
+                done = []
+                color = data.get("color") or color
+                waiting = len(data.get("names") or [])
+                if waiting and live():
+                    shown = show_live(data.get("names") or [], color)
+                    if shown:
+                        pull(shown, st)                   # tell the website right away
+                    last_check = time.time() - every + 2  # check again soon for more
+                    continue
+                if waiting:
+                    prefetch(data.get("names") or [])     # spoken names are ready before the break
+                if waiting and not queued:
+                    pl = queue_break(data.get("names") or [])
+                    queued = True
+                    log("%d name(s) waiting - '%s' queued after the current song" % (waiting, pl))
+            time.sleep(1)
+        except Exception as e:
+            log("problem:", e, "- trying again shortly")
+            time.sleep(every)
+
+
+if __name__ == "__main__":
+    main()
