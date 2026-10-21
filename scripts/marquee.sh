@@ -32,6 +32,8 @@ start() {
 	if pid_running >/dev/null; then
 		return 0
 	fi
+	local w
+	for w in 1 2 3 4 5; do [ -f "$CONF" ] && break; sleep 1; done   # an update may still be writing it
 	[ -f "$CONF" ] || { note "not connected yet: paste your connection code in Content Setup -> Marquee"; return 0; }
 	local op of
 	if op=$(old_running); then   # a copy put on by hand whose file was deleted: a leftover, stop it

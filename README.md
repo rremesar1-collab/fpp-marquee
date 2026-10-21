@@ -22,7 +22,7 @@ Only to your own website (the address in your connection code): what's playing, 
 - Log: `logs/plugin-fpp-marquee.log`
 - Spoken names: `music/marquee-voice-*` (newest 300 kept)
 
-Uninstalling stops the script and removes its settings and the spoken names. The names break playlists and their audio stay, since your show may use them.
+Uninstalling stops the script and removes the saved spoken names. Your connection settings stay, so reinstalling or updating picks up where it left off; click Disconnect on the plugin page first if you want this FPP to forget your website. The names break playlists and their audio stay, since your show may use them.
 
 ## Help
 Open an issue, or use **Marquee → Get help** on your website.
