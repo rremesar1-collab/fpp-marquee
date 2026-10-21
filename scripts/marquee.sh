@@ -33,6 +33,14 @@ start() {
 		return 0
 	fi
 	[ -f "$CONF" ] || { note "not connected yet: paste your connection code in Content Setup -> Marquee"; return 0; }
+	local op of
+	if op=$(old_running); then   # a copy put on by hand whose file was deleted: a leftover, stop it
+		of=$(tr '\0' '\n' < "/proc/$op/cmdline" 2>/dev/null | sed -n 2p)
+		if [ -n "$of" ] && [ ! -f "$of" ]; then
+			note "stopping the old names script you put on the FPP by hand (its file is gone)"
+			kill "$op" 2>/dev/null; sleep 1; [ -d "/proc/$op" ] && kill -9 "$op" 2>/dev/null
+		fi
+	fi
 	if old_running >/dev/null; then
 		note "not starting: the names script you put on the FPP by hand is still running - remove its Run Script command preset (see Content Setup -> Marquee)"
 		return 0
