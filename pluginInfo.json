@@ -1,6 +1,6 @@
 {
 	"repoName": "fpp-marquee",
-	"name": "Marquee - Your Name in Lights",
+	"name": "Marquee - Your Name in Lights (TEST)",
 	"author": "Alateka Corporation (rremesar1-collab)",
 	"description": "Puts the first names kids send on your Marquee show website up on your matrix, TV or projector, between songs or during them. Runs the Marquee names script for you: paste the connection code from your website (Marquee -> Settings -> Names & FPP) and it starts with FPP. It checks in with your own website (the address in the code) to fetch waiting names and your screen settings, and reports what's playing and its setup check back. During a Marquee Support session that you open on your website, it also sends this FPP's status, playlists and log there and can run a few fixes (setup check, names break playlists, restart). Spoken names and the names break audio are downloaded from your website into your music folder.",
 	"homeURL": "https://github.com/rremesar1-collab/fpp-marquee",
@@ -60,7 +60,7 @@
 		{
 			"minFPPVersion": "10.0",
 			"maxFPPVersion": "0",
-			"branch": "main",
+			"branch": "test-names-easy",
 			"sha": ""
 		}
 	]
