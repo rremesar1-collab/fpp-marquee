@@ -17,6 +17,7 @@
 			<div class="d-flex flex-wrap align-items-center gap-2 mb-2">
 				<h3 class="h5 mb-0 me-2">Status</h3>
 				<span class="badge text-bg-secondary" id="mqState">Checking…</span>
+				<span class="badge text-bg-light border" id="mqVer"></span>
 				<span class="text-body-secondary small" id="mqSite"></span>
 			</div>
 			<div class="d-flex flex-wrap gap-2" id="mqConnectedBtns">
@@ -88,6 +89,7 @@
 			log.textContent = (d.log || []).join('\n') || 'Nothing yet.';
 			if (atEnd) { log.scrollTop = log.scrollHeight; }
 			$('mqVersion').textContent = d.version ? 'Marquee names script ' + d.version : '';
+			$('mqVer').textContent = d.version ? 'Script ' + d.version : 'Script version unknown';
 		}).catch(function (e) { $('mqState').textContent = 'Couldn’t read the status'; $('mqState').title = String(e && e.message || e); console.log('[Marquee] status', e); });
 	}
 	$('mqConnect').addEventListener('click', function () {
