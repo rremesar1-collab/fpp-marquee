@@ -32,6 +32,29 @@
 		</div>
 	</div>
 
+	<div class="card mb-3 d-none" id="mqTiming">
+		<div class="card-body">
+			<h3 class="h5">Your own names break audio</h3>
+			<p class="mb-2">Only if your names break plays <b>your own</b> audio with an announcer (made in xLights, not with the builder on your website). Tell the script where the quiet part is, so names are only said there and never over your announcer. Leave both empty if you use the website's break.</p>
+			<div class="row g-2 align-items-end" style="max-width: 34rem">
+				<div class="col-sm">
+					<label class="form-label small mb-1" for="mqOwnStart">First name at (seconds)</label>
+					<input type="number" class="form-control" id="mqOwnStart" min="0" max="600" step="0.1" placeholder="e.g. 12">
+					<div class="form-text">When the intro talking ends.</div>
+				</div>
+				<div class="col-sm">
+					<label class="form-label small mb-1" for="mqOwnEnd">Closing starts at (seconds)</label>
+					<input type="number" class="form-control" id="mqOwnEnd" min="0" max="600" step="0.1" placeholder="e.g. 19">
+					<div class="form-text">When the announcer starts talking again.</div>
+				</div>
+				<div class="col-sm-auto">
+					<button type="button" class="buttons btn btn-success" id="mqOwnSave">Save</button>
+				</div>
+			</div>
+			<div class="form-text mt-2">Tip: in xLights, the times are where your announcer's words end and start again (the timing track shows them). About 3.3 seconds fit one name; the rest of the break shows names that were already said, with no voice.</div>
+		</div>
+	</div>
+
 	<div class="card mb-3">
 		<div class="card-body">
 			<h3 class="h5" id="mqConnectTitle">Connect to your website</h3>
@@ -76,6 +99,7 @@
 		});
 	}
 	function busy(b, on) { b.disabled = on; }
+	var timingLoaded = false;
 	function load() {
 		return call('GET', 'status').then(function (d) {
 			var st = $('mqState'), labels = { running: ['Running', 'text-bg-success'], byhand: ['Old script running', 'text-bg-warning'], stopped: [d.site ? 'Stopped' : 'Not connected', d.site ? 'text-bg-danger' : 'text-bg-secondary'] };
@@ -90,6 +114,12 @@
 			if (atEnd) { log.scrollTop = log.scrollHeight; }
 			$('mqVersion').textContent = d.version ? 'Marquee names script ' + d.version : '';
 			$('mqVer').textContent = d.version ? 'Script ' + d.version : 'Script version unknown';
+			$('mqTiming').classList.toggle('d-none', !d.site);
+			if (!timingLoaded) {
+				timingLoaded = true;
+				$('mqOwnStart').value = d.own_start ? d.own_start : '';
+				$('mqOwnEnd').value = d.own_end ? d.own_end : '';
+			}
 		}).catch(function (e) { $('mqState').textContent = 'Couldn’t read the status'; $('mqState').title = String(e && e.message || e); console.log('[Marquee] status', e); });
 	}
 	$('mqConnect').addEventListener('click', function () {
@@ -114,6 +144,12 @@
 	$('mqDisconnect').addEventListener('click', function () {
 		if (!window.confirm('Disconnect this FPP from your website? Names stop going up here.')) { return; }
 		call('POST', 'disconnect').then(function (d) { say(d.message, 'ok'); load(); });
+	});
+	$('mqOwnSave').addEventListener('click', function () {
+		var b = this; busy(b, true); say('Saving…', 'warn');
+		call('POST', 'timing', { own_start: $('mqOwnStart').value, own_end: $('mqOwnEnd').value })
+			.then(function (d) { say(d.message, d.ok ? 'ok' : 'bad'); setTimeout(load, 2000); })
+			.catch(function () { say('Something went wrong. Try again.', 'bad'); }).then(function () { busy(b, false); });
 	});
 	$('mqRefresh').addEventListener('click', load);
 	load();

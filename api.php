@@ -6,6 +6,7 @@
  *   POST disconnect  - stop the script and forget the website
  *   POST restart     - restart the script
  *   POST test        - {"text": "TEST"}: show a name on your screens now
+ *   POST timing      - {"own_start": 12, "own_end": 19}: the quiet part of the show's own break audio
  */
 
 function getEndpointsfppmarquee()
@@ -16,6 +17,7 @@ function getEndpointsfppmarquee()
 		array('method' => 'POST', 'endpoint' => 'disconnect', 'callback' => 'fppMarqueeDisconnect'),
 		array('method' => 'POST', 'endpoint' => 'restart', 'callback' => 'fppMarqueeRestart'),
 		array('method' => 'POST', 'endpoint' => 'test', 'callback' => 'fppMarqueeTest'),
+		array('method' => 'POST', 'endpoint' => 'timing', 'callback' => 'fppMarqueeTiming'),
 	);
 }
 
@@ -89,6 +91,8 @@ function fppMarqueeStatus()
 		'site' => $conf ? (string) $conf['site'] : '',
 		'version' => fppMarqueeVersion(),
 		'byhandFile' => is_file($p['byhand']),
+		'own_start' => $conf && !empty($conf['own_start']) ? (float) $conf['own_start'] : 0,
+		'own_end' => $conf && !empty($conf['own_end']) ? (float) $conf['own_end'] : 0,
 		'log' => $lines,
 	));
 }
@@ -169,4 +173,32 @@ function fppMarqueeTest()
 	$n = preg_match('/shown on (\d+) screen/', $out, $m) ? (int) $m[1] : 0;
 	return json(array('ok' => $n > 0, 'message' => $n > 0 ? 'Shown on ' . $n . ' screen' . ($n > 1 ? 's' : '') . '.' : 'No screen showed it. ' . substr($out, -300)));
 }
-?>
+
+/* POST /api/plugin/fpp-marquee/timing  {"own_start": 12, "own_end": 19}  (empty = use the website's timing) */
+function fppMarqueeTiming()
+{
+	$p = fppMarqueePaths();
+	$c = fppMarqueeConf();
+	if (!$c) {
+		return json(array('ok' => false, 'message' => 'Paste your connection code first.'));
+	}
+	$b = fppMarqueeBody();
+	$a = isset($b['own_start']) && '' !== trim((string) $b['own_start']) ? round((float) $b['own_start'], 2) : 0;
+	$e = isset($b['own_end']) && '' !== trim((string) $b['own_end']) ? round((float) $b['own_end'], 2) : 0;
+	if (($a || $e) && ($a <= 0 || $e < $a + 2.5)) {
+		return json(array('ok' => false, 'message' => 'The closing has to start at least 2.5 seconds after the first name (one name needs about 3 seconds).'));
+	}
+	$c['own_start'] = $a;
+	$c['own_end'] = $e;
+	$tmp = $p['conf'] . '.tmp';
+	if (@file_put_contents($tmp, json_encode($c, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)) === false || !@rename($tmp, $p['conf'])) {
+		return json(array('ok' => false, 'message' => 'Couldn’t save the settings in ' . $p['data'] . '. Reinstall the plugin.'));
+	}
+	fppMarqueeRun('restart');
+	if (!$a) {
+		return json(array('ok' => true, 'message' => 'Saved. Names use the timing from your website.'));
+	}
+	$n = max(1, (int) floor(($e - $a + 0.3) / 3.3));
+	return json(array('ok' => true, 'message' => 'Saved. ' . $n . ' name' . ($n > 1 ? 's are' : ' is') . ' said between ' . $a . ' and ' . $e . ' seconds in each break.'));
+}
+
