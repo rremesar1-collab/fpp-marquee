@@ -65,7 +65,7 @@
 	},
 	"versions": [
 		{
-			"minFPPVersion": "10.0",
+			"minFPPVersion": "9.0",
 			"maxFPPVersion": "0",
 			"branch": "main",
 			"sha": ""

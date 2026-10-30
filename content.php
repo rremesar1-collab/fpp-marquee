@@ -35,7 +35,7 @@
 	<div class="card mb-3 d-none" id="mqTiming">
 		<div class="card-body">
 			<h3 class="h5">Your own names break audio</h3>
-			<p class="mb-2">Only if your names break plays <b>your own</b> audio with an announcer (made in xLights, not with the builder on your website). Tell the script where the quiet part is, so names are only said there and never over your announcer. Leave both empty if you use the website's break.</p>
+			<p class="mb-2">Only if your names break plays <b>your own</b> audio with an announcer (made in xLights, not with the builder on your website). Tell the script where the quiet part is, so names are only said there and never over your announcer. Leave both empty if you use the website's break. <b>Easier:</b> set these on your website instead (Names in Lights → Names break → Names break audio → Use my own names break audio); the website's times win when both are set.</p>
 			<div class="row g-2 align-items-end" style="max-width: 34rem">
 				<div class="col-sm">
 					<label class="form-label small mb-1" for="mqOwnStart">First name at (seconds)</label>
