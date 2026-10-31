@@ -36,7 +36,8 @@
 		<div class="card-body">
 			<h3 class="h5">Your own names break audio</h3>
 			<p class="mb-2">Only if your names break plays <b>your own</b> audio with an announcer (made in xLights, not with the builder on your website). Tell the script where the quiet part is, so names are only said there and never over your announcer. Leave both empty if you use the website's break. <b>Easier:</b> set these on your website instead (Names in Lights → Names break → Names break audio → Use my own names break audio); the website's times win when both are set.</p>
-			<div class="row g-2 align-items-end" style="max-width: 34rem">
+			<div class="alert alert-success py-2 mb-2 d-none" id="mqOwnSite">Set on your website: first name at <b id="mqOwnSiteA"></b> seconds, closing starts at <b id="mqOwnSiteB"></b> seconds. These are the times the names break uses. To change them, go to your website: Marquee → Settings → Names in Lights → Names break.</div>
+			<div class="row g-2 align-items-end" style="max-width: 34rem" id="mqOwnLocal">
 				<div class="col-sm">
 					<label class="form-label small mb-1" for="mqOwnStart">First name at (seconds)</label>
 					<input type="number" class="form-control" id="mqOwnStart" min="0" max="600" step="0.1" placeholder="e.g. 12">
@@ -115,6 +116,13 @@
 			$('mqVersion').textContent = d.version ? 'Marquee names script ' + d.version : '';
 			$('mqVer').textContent = d.version ? 'Script ' + d.version : 'Script version unknown';
 			$('mqTiming').classList.toggle('d-none', !d.site);
+			var site = d.site_own;   // 3.16.2+: times set on the website win, so show those and hide the boxes here
+			$('mqOwnSite').classList.toggle('d-none', !site);
+			$('mqOwnLocal').classList.toggle('d-none', !!site);
+			if (site) {
+				$('mqOwnSiteA').textContent = site.own_start;
+				$('mqOwnSiteB').textContent = site.own_end;
+			}
 			if (!timingLoaded) {
 				timingLoaded = true;
 				$('mqOwnStart').value = d.own_start ? d.own_start : '';

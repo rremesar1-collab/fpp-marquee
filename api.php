@@ -93,8 +93,21 @@ function fppMarqueeStatus()
 		'byhandFile' => is_file($p['byhand']),
 		'own_start' => $conf && !empty($conf['own_start']) ? (float) $conf['own_start'] : 0,
 		'own_end' => $conf && !empty($conf['own_end']) ? (float) $conf['own_end'] : 0,
+		'site_own' => fppMarqueeSiteOwn(),
 		'log' => $lines,
 	));
+}
+
+/* The own-audio times set on the website (the names script saves what the website sent). */
+function fppMarqueeSiteOwn()
+{
+	$p = fppMarqueePaths();
+	$f = $p['data'] . '/site_own.json';
+	$d = is_file($f) ? json_decode((string) @file_get_contents($f), true) : null;
+	if (!is_array($d) || empty($d['own_start']) || empty($d['own_end'])) {
+		return null;
+	}
+	return array('own_start' => (float) $d['own_start'], 'own_end' => (float) $d['own_end']);
 }
 
 /* POST /api/plugin/fpp-marquee/connect  {"code": "MQ1-..."} */
