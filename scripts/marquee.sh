@@ -47,6 +47,11 @@ start() {
 		note "not starting: the names script you put on the FPP by hand is still running - remove its Run Script command preset (see Content Setup -> Marquee)"
 		return 0
 	fi
+	local lp   # a lock left from before a restart can point at some other program now: clear it
+	lp=$(cat "$DATA/marquee_names.pid" 2>/dev/null)
+	if [ -n "$lp" ] && ! grep -q marquee_names "/proc/$lp/cmdline" 2>/dev/null; then
+		rm -f "$DATA/marquee_names.pid"
+	fi
 	local run="env MARQUEE_PLUGIN=1 MARQUEE_NAMES_CONFIG=$CONF MARQUEE_DATA=$DATA MARQUEE_LOCK=$DATA/marquee_names.pid MARQUEE_LOG=$LOG python3 $SCRIPT"
 	[ "$(id -u)" = "0" ] && [ -f "$LOG" ] && chown "${FPPUSER:-fpp}:${FPPGROUP:-fpp}" "$LOG" 2>/dev/null
 	if [ "$(id -u)" = "0" ]; then
