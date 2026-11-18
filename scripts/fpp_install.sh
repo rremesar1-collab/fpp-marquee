@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 # Marquee plugin install (safe to run again).
 : "${FPPDIR:=/opt/fpp}"
 . "${FPPDIR}/scripts/common"
