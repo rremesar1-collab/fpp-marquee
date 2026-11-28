@@ -41,7 +41,7 @@ import socket
 import threading
 import urllib.request
 
-VERSION = "3.18.0"
+VERSION = "3.18.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Where the settings file may be: next to this script, or wherever FPP's File Manager
 # put it (it files .json uploads under Uploads or Config, not Scripts).
@@ -1069,6 +1069,20 @@ def queue_break(names=None):
 MIX = {"pl": "", "names": [], "slots": 0, "slot": 0.0, "start": 0.0, "until": 0.0, "turns": None, "first": 0,
        "says": {}, "file": "", "t": 0.0, "color": ""}
 MIX_PREFIX = "marquee-names-mix-"
+
+
+MIX_LEAD = 40      # 3.18.1: the break music with the names is made this many seconds before the song ends
+
+
+def mix_later(st, names):
+    """Seconds to wait before lining up a names break whose music gets the names mixed in (0 = line it up now)."""
+    if mix_why_not(st) != "" or plan_break(names) != S["break_playlist"]:
+        return 0
+    try:
+        rem = float(st.get("seconds_remaining") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return rem - MIX_LEAD if rem > MIX_LEAD else 0
 
 
 def mix_playlist():
@@ -2786,9 +2800,28 @@ def main():
                         log("%d name(s) waiting - names go up after every %d songs (%d played since the last break)"
                             % (waiting, int(S["every"]), SONGS["played"]))
                 elif waiting and not queued:
-                    pl = queue_break(data.get("names") or [])
-                    queued = QUEUED['on'] = True
-                    log("%d name(s) waiting - '%s' queued after the current song" % (waiting, pl))
+                    wait_for = mix_later(st, data.get("names") or [])
+                    if wait_for:
+                        # 3.18.1: names mixed into the break music: line the break up near the end of the song,
+                        # so names sent during it make this break, not the next one
+                        if not LAST.get("mix_wait_said"):
+                            LAST["mix_wait_said"] = True
+                            log("%d name(s) waiting - the break music with the names is made %ds before this song ends, "
+                                "so names sent during it go up too" % (waiting, MIX_LEAD))
+                        last_check = time.time() - every + max(1.0, min(float(every), wait_for))
+                    else:
+                        LAST["mix_wait_said"] = False
+                        names_now = data.get("names") or []
+                        if MIX_LEAD and mix_why_not(st) == "":
+                            try:
+                                fresh = pull([], st)     # the very latest names, right before the file is made
+                                if isinstance(fresh, dict) and fresh.get("names"):
+                                    names_now = fresh["names"]
+                            except Exception:
+                                pass
+                        pl = queue_break(names_now)
+                        queued = QUEUED['on'] = True
+                        log("%d name(s) waiting - '%s' queued after the current song" % (len(names_now), pl))
             time.sleep(0.25 if queued else 1)   # a break is coming: catch its start within a quarter second
         except Exception as e:
             log("problem:", e, "- trying again shortly")
