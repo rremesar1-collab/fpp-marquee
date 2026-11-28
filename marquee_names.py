@@ -41,7 +41,7 @@ import socket
 import threading
 import urllib.request
 
-VERSION = "3.17.7"
+VERSION = "3.18.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Where the settings file may be: next to this script, or wherever FPP's File Manager
 # put it (it files .json uploads under Uploads or Config, not Scripts).
@@ -102,6 +102,8 @@ DEFAULTS = {
     "every": 1,                       # a names break after every this many songs (names collect in between)
     "music_slot": 1,                  # FPP media stream slot for the names break's own music (the break with no fixed timing)
     "flow": True,                     # Marquee's simple break: run it with no fixed timing when the website sent its parts
+    "mix_names": False,               # 3.18: mix the spoken names into the break's music file a song ahead, so phone
+                                      #   audio apps (PulseMesh) that play the show's files play the names too
 }
 MODE = {"mode": None, "show_for": None}   # what the website said last (it wins over the settings file)
 ADVISORY = {"now": None, "last": 0.0}     # traffic & parking alert from Show Control, put on the screens now and then
@@ -254,6 +256,9 @@ def site_config(cfg):
     if cfg.get("break_playlist") not in (None, "") and str(cfg["break_playlist"]) != S["break_playlist"] and "bp" in LAST:
         CHECK["want"] = CHECK["want"] or "changed"
     LAST["bp"] = True
+    if "mix_names" in cfg and bool(cfg.get("mix_names")) != bool(S.get("mix_names")):
+        S["mix_names"] = bool(cfg.get("mix_names"))
+        log("names mixed into the break music (for phone audio like PulseMesh):", "on" if S["mix_names"] else "off")
     if "talk_effect" in cfg and str(cfg.get("talk_effect") or "").strip() != str(S.get("talk_effect") or "").strip():
         # 3.17.6: the website's box is the one to go by, even emptied (an emptied box used to keep the old effects)
         S["talk_effect"] = str(cfg.get("talk_effect") or "").strip()
@@ -783,7 +788,7 @@ def in_break(st):
     if status_name(st) != "playing":
         return False
     pl = playlist_name(st)
-    if pl == S["break_playlist"] or pl in short_playlists().values() or pl in theme_playlists().values():
+    if pl == S["break_playlist"] or pl == mix_playlist() or pl in short_playlists().values() or pl in theme_playlists().values():
         return True
     seq = (st.get("current_sequence") or "").lower().replace("_", " ")
     return "names in lights" in seq
@@ -1048,8 +1053,189 @@ def queue_break(names=None):
                 pl = bp
         except Exception as e:
             log("could not set the names break's length, using its fixed timing -", e)
+    if pl == bp:
+        mixed = make_mix(names or [])
+        if mixed:
+            pl = mixed
     fpp_command(MASTER, "Insert Playlist After Current", [pl, -1, -1, "true"])
     return pl
+
+
+# ------------------------------------ names mixed into the break's music ----
+# 3.18: phone audio apps like PulseMesh don't hear the FPP: they play their own copy of each audio file,
+# in step with the show. A spoken name played over the break never reaches them. So, a song ahead, the
+# names going up next are mixed into a copy of the break's music, and the break plays that file. Speakers,
+# FM and phones then all hear the same thing. Names that come in after it's made go up in the next break.
+MIX = {"pl": "", "names": [], "slots": 0, "slot": 0.0, "start": 0.0, "until": 0.0, "turns": None, "first": 0,
+       "says": {}, "file": "", "t": 0.0, "color": ""}
+MIX_PREFIX = "marquee-names-mix-"
+
+
+def mix_playlist():
+    return S["break_playlist"] + " (names mixed)"
+
+
+def ffmpeg_bin():
+    import shutil
+    return shutil.which("ffmpeg") or ("/usr/bin/ffmpeg" if os.path.exists("/usr/bin/ffmpeg") else "")
+
+
+def mix_why_not(st):
+    """'' when the next break can have its names mixed into its music, else why not (for the log)."""
+    if not S.get("mix_names"):
+        return "off"
+    if live():
+        return "names go up during the songs (no names break)"
+    if not S["voice"] or not VOICE_ON.get("site"):
+        return "spoken names are off"
+    if not own_window()[1]:
+        return "this needs your own names break audio (First name at and Closing starts at, on the website)"
+    if not ffmpeg_bin():
+        return "this FPP has no ffmpeg"
+    try:
+        rem = float(st.get("seconds_remaining") or 0)
+    except (TypeError, ValueError):
+        rem = 0.0
+    if status_name(st) == "playing" and 0 < rem < 12:
+        return "the current song ends in %ds, too soon to make the file (the names are said over the break instead)" % rem
+    return ""
+
+
+def mix_plan(everyone):
+    """The names, spots and turn length of the next names break (the same rules as when a break starts)."""
+    a, b = own_window()
+    n = max(1, int((b - a + 0.3) / 3.3))
+    S["names_start"], S["slot"] = a, (b - a) / n
+    S["show_for"] = max(2.0, S["slot"] - 0.6)
+    slots = min(n, int(S["max_names"]))
+    cands = (eligible(everyone, "") or everyone)[:slots]
+    if cands:
+        need = max(max(need_secs(c.get("text", "")) + 0.4 for c in cands), max(say_secs(c) for c in cands) + 0.6)
+        window = slots * float(S["slot"])
+        if need > float(S["slot"]) + 0.05:
+            fit = max(1, int(window // need))
+            while fit < min(slots, len(cands)) and window / (fit + 1) >= 0.8 * need:
+                fit += 1
+            if fit < slots:
+                S["slot"] = window / fit
+                S["show_for"] = max(2.0, S["slot"] - 0.6)
+                slots = fit
+    return cands[:slots], slots, b
+
+
+def mix_schedule(names, slots, outro_at):
+    """When each name is said in the break, by the same rules as a live break (never over Santa).
+    Returns (turns, first turns, {turn: (kid, clip file, seconds long, seconds into the break)})."""
+    turns, first = plan_turns(names, slots, outro_at)
+    says, done, owed, with_pic = {}, set(), set(), set()
+    voice_end = 0.0
+    for k, (kind, item) in enumerate(turns):
+        at = float(S["names_start"]) + k * float(S["slot"])
+        iid = item.get("id")
+        repeat = k >= first and iid in done
+        sf = say_secs(item) or 2.0
+        if kind == "pic":
+            go = not repeat or iid in owed or (S["say_every_time"] and at >= voice_end and at + sf <= outro_at - 0.3)
+        elif (k - 1, iid) in with_pic:
+            go = False
+        elif repeat and iid not in owed and (at < voice_end or at + sf > outro_at - 0.3):
+            go = False
+        else:
+            go = S["say_every_time"] or not repeat or iid in owed
+        if go:
+            t = max(at, voice_end + 0.15)
+            if t > at and t + sf > outro_at - 0.3:
+                owed.add(iid)                        # no time before the closing: said on its next turn
+            else:
+                clip = voice_file(item)
+                if clip:
+                    says[k] = (item, clip, sf, t)
+                    voice_end = t + sf
+                    owed.discard(iid)
+        if kind == "pic":
+            with_pic.add((k, iid))
+        done.add(iid)
+    return turns, first, says
+
+
+def mix_audio(media, says, out_path):
+    """ffmpeg: the break's music with each spoken name laid over it at its time. Returns '' or the error."""
+    import subprocess
+    vol = max(0.1, 1.0 + float(S["voice_volume"]) / 100.0)
+    args = [ffmpeg_bin(), "-y", "-hide_banner", "-loglevel", "error", "-i", media]
+    parts = ["[0:a]aformat=sample_rates=44100:channel_layouts=stereo[m]"]
+    labels = "[m]"
+    for j, k in enumerate(sorted(says)):
+        item, clip, sf, t = says[k]
+        ms = int(round(t * 1000))
+        args += ["-i", os.path.join(MUSIC, clip)]
+        parts.append("[%d:a]aformat=sample_rates=44100:channel_layouts=stereo,volume=%.2f,adelay=%d|%d[v%d]" % (j + 1, vol, ms, ms, j))
+        labels += "[v%d]" % j
+    parts.append("%samix=inputs=%d:duration=first:dropout_transition=0:normalize=0[out]" % (labels, len(says) + 1))
+    args += ["-filter_complex", ";".join(parts), "-map", "[out]", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", out_path]
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 10000:
+        return (r.stderr or b"").decode("utf-8", "replace").strip()[-200:] or "no file made"
+    return ""
+
+
+def make_mix(everyone):
+    """Mix the next break's names into its music and point a copy of the break playlist at that file.
+    Returns the playlist to play, or '' (the break plays as usual, with the names said over it)."""
+    MIX["pl"] = ""
+    st = master_status()
+    why = mix_why_not(st)
+    if why:
+        if why != "off" and time.time() - LAST.get("mix_said", 0) > 600:
+            LAST["mix_said"] = time.time()
+            log("names not mixed into the break music -", why)
+        return ""
+    bp = S["break_playlist"]
+    try:
+        base = fpp_playlist(bp)
+        entries = [e for e in ((base or {}).get("mainPlaylist") or []) if isinstance(e, dict) and e.get("sequenceName")]
+        media = entries[0].get("mediaName") if entries else ""
+        if not media or not os.path.exists(os.path.join(MUSIC, media)):
+            log("names not mixed into the break music - the '%s' playlist has no audio file with its sequence" % bp)
+            return ""
+        names, slots, outro_at = mix_plan(everyone)
+        if not names:
+            return ""
+        turns, first, says = mix_schedule(names, slots, outro_at)
+        if not says:
+            log("names not mixed into the break music - no spoken names to mix")
+            return ""
+        t0 = time.time()
+        out = MIX_PREFIX + time.strftime("%H%M%S") + ".mp3"
+        tmp = os.path.join(MUSIC, ".marquee-mix.part")
+        err = mix_audio(os.path.join(MUSIC, media), says, tmp)
+        if err:
+            log("names not mixed into the break music - ffmpeg:", err)
+            return ""
+        os.replace(tmp, os.path.join(MUSIC, out))
+        mine = dict(base)
+        e = dict(entries[0])
+        e["type"] = "both"
+        e["mediaName"] = out
+        mine["name"] = mix_playlist()
+        mine["desc"] = "Made by Marquee: the names break with the next names mixed into its music (remade before each break)"
+        mine["mainPlaylist"] = [e]
+        save_playlist(mix_playlist(), mine)
+        _playlists["t"] = 0
+        MIX.update(pl=mix_playlist(), names=names, slots=slots, slot=float(S["slot"]), start=float(S["names_start"]),
+                   until=outro_at, turns=turns, first=first, says=says, file=out, t=time.time())
+        # older breaks' files go (FPP and PulseMesh only need the next one)
+        try:
+            for f in os.listdir(MUSIC):
+                if f.startswith(MIX_PREFIX) and f != out and os.path.getmtime(os.path.join(MUSIC, f)) < time.time() - 1200:
+                    os.remove(os.path.join(MUSIC, f))
+        except OSError:
+            pass
+        log("names mixed into the break music (%s, made in %.1fs): %s" % (out, time.time() - t0, ", ".join(n.get("text", "") for n in names)))
+        return mix_playlist()
+    except Exception as e:
+        log("names not mixed into the break music -", e)
+        return ""
 
 
 # ------------------------------------------------ break with no fixed timing ----
@@ -1434,6 +1620,11 @@ def say(item):
         return 0
     SAY["last"] = "said"
     log("saying:", item.get("text"))
+    return start_talking(item)
+
+
+def start_talking(item):
+    """Start the talking faces (the website's talking faces effect). Returns when to stop them, or 0."""
     effs = talk_effects()
     if not effs:
         if not LAST.get("no_talk"):
@@ -1783,6 +1974,23 @@ def _run_break(color):
     ping_break_started()
     if flow_ready() and playlist_name(master_status()) == S["break_playlist"]:
         return _run_flow(color)
+    st0 = master_status()
+    if MIX["pl"] and playlist_name(st0) == MIX["pl"] and time.time() - MIX["t"] < 1800:
+        # 3.18: this break plays the file with the names mixed in: the same names, at the same times
+        S["names_start"], S["slot"] = MIX["start"], MIX["slot"]
+        S["show_for"] = max(2.0, S["slot"] - 0.6)
+        QUIET["until"] = MIX["until"]
+        names, slots = MIX["names"], MIX["slots"]
+        LAST["spots"] = slots
+        CUR.update(kind="timed (names in the break music)", note="")
+        log("break started with %d name(s), %d slot(s) - names in the break music" % (len(names), slots))
+        try:
+            shown = _show_names(names, slots, MIX.get("color") or color)
+        finally:
+            MIX["pl"] = ""
+        for i in shown:
+            SKIPS.pop(i, None)
+        return shown
     try:
         fresh = LATEST["data"] is not None and time.time() - LATEST["t"] < 90 and LATEST["t"] >= BRK["end"]
         data = LATEST["data"] if fresh else pull([])      # the names we already have: no waiting on the internet
@@ -1909,7 +2117,11 @@ def _show_turns(names, slots, color, rows):
         # extra spots the break has room for are shown, but not said: Santa's own outro is talking by then
         outro_at = min(outro_at, QUIET["until"])
     QUIET["until"] = 0.0
-    turns, first = plan_turns(names, slots, outro_at)
+    mixed = bool(MIX["pl"]) and MIX["names"] is names
+    if mixed:
+        turns, first = MIX["turns"], MIX["first"]
+    else:
+        turns, first = plan_turns(names, slots, outro_at)
     said = set()                                     # (turn, kid) where the name was said with the picture
     owed = set()                                     # 3.17.7: kids not said yet because Santa was still talking
 
@@ -1945,12 +2157,49 @@ def _show_turns(names, slots, color, rows):
                 break
             time.sleep(0.1)
         late = el - at
-        if late > 0.5 * float(S["slot"]) and k + 1 < len(turns):
+        if late > 0.5 * float(S["slot"]) and k + 1 < len(turns) and not mixed:
             # running late (a slow website, a spoken name still downloading): skip this turn rather than
             # putting two names up at once and talking over the announcer; the name comes round again
             log("running %.1fs late - skipping turn %d" % (late, k + 1))
             continue
         repeat = k >= first and item["id"] in done   # a kid whose first turn was skipped (running late) is said on the next one
+        if mixed:
+            # 3.18: the names are in the break's music: put each up on its turn, and move the faces while
+            # Santa says it (at the time it was mixed in)
+            if kind == "pic":
+                if PIC_ON or HELD:
+                    clear_pictures()
+                if show_picture(item):
+                    log("showing the picture of:", item["text"])
+                elif show(item["text"], color):
+                    log("showing:", item["text"])
+                else:
+                    continue
+            else:
+                if HELD:
+                    clear_pictures(names_only=True)
+                if not show(item["text"], color):
+                    log("no screen took", item["text"], "- it will wait for the next break")
+                    rows.setdefault(item.get("id"), {}).setdefault("voice", "no screen took it")
+                    continue
+                log("showing:", item["text"])
+            _mark(rows, item, shown=True)
+            if k in MIX["says"]:
+                sat = MIX["says"][k][3]
+                while True:
+                    st = master_status()
+                    if not in_break(st) or elapsed(st) >= sat - 0.05:
+                        break
+                    time.sleep(0.05)
+                if talk_until:
+                    stop_talking()
+                talk_until = start_talking(item)
+                SAY["last"] = "said (in the break music)"
+                log("saying (in the break music):", item.get("text"))
+                _mark(rows, item, said=True)
+            if item["id"] not in done:
+                done.append(item["id"])
+            continue
         if kind == "pic":
             if PIC_ON or HELD:
                 clear_pictures()                         # the last name or picture comes down first
